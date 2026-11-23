@@ -1,8 +1,10 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
+
+use dashmap::DashMap;
 
 use crate::{error::Error, AppState};
 
@@ -31,10 +33,15 @@ impl PgnParser {
         self.reader.stream_position()
     }
 
-    fn offset_by_index(&mut self, n: usize, state: &AppState, file: &String) -> io::Result<()> {
+    fn offset_by_index(
+        &mut self,
+        n: usize,
+        offsets: &DashMap<String, Vec<u64>>,
+        file: &str,
+    ) -> io::Result<()> {
         let offset_index = n / GAME_OFFSET_FREQ;
         let n_left = n % GAME_OFFSET_FREQ;
-        let wrapped_pgn_offsets = state.pgn_offsets.get(file);
+        let wrapped_pgn_offsets = offsets.get(file);
         if wrapped_pgn_offsets.is_none() {
             self.reader.seek(SeekFrom::Start(self.start))?;
             self.skip_games(n)?;
@@ -194,7 +201,11 @@ pub async fn read_games(
 
     let mut parser = PgnParser::new(file_r.try_clone()?);
 
-    parser.offset_by_index(start as usize, &state, &file.to_string_lossy().to_string())?;
+    parser.offset_by_index(
+        start as usize,
+        &state.pgn_offsets,
+        file.to_string_lossy().as_ref(),
+    )?;
 
     let mut games: Vec<String> = Vec::with_capacity((end - start) as usize);
 
@@ -215,11 +226,16 @@ pub async fn delete_game(
     n: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), Error> {
-    let file_r = File::open(&file)?;
+    delete_game_file(&file, n, &state.pgn_offsets)
+}
+
+fn delete_game_file(file: &Path, n: i32, offsets: &DashMap<String, Vec<u64>>) -> Result<(), Error> {
+    let file_r = File::open(file)?;
 
     let mut parser = PgnParser::new(file_r.try_clone()?);
+    let file_key = file.to_string_lossy();
 
-    parser.offset_by_index(n as usize, &state, &file.to_string_lossy().to_string())?;
+    parser.offset_by_index(n as usize, offsets, file_key.as_ref())?;
 
     let starting_bytes = parser.position()?;
 
@@ -230,6 +246,9 @@ pub async fn delete_game(
     file_w.seek(SeekFrom::Start(starting_bytes))?;
 
     write_to_end(&mut parser.reader, &mut file_w)?;
+
+    offsets.remove(file_key.as_ref());
+
     Ok(())
 }
 
@@ -248,21 +267,30 @@ pub async fn write_game(
     pgn: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), Error> {
-    let file = PathBuf::from(file_path);
+    write_game_file(Path::new(&file_path), n, &pgn, &state.pgn_offsets)
+}
+
+fn write_game_file(
+    file: &Path,
+    n: i32,
+    pgn: &str,
+    offsets: &DashMap<String, Vec<u64>>,
+) -> Result<(), Error> {
     if !file.exists() {
-        File::create(&file)?;
+        File::create(file)?;
     }
 
-    let mut file_r = File::open(&file)?;
-    let mut file_w = OpenOptions::new().write(true).open(&file)?;
+    let mut file_r = File::open(file)?;
+    let mut file_w = OpenOptions::new().write(true).open(file)?;
 
     let mut tmpf = tempfile::tempfile()?;
     io::copy(&mut file_r.try_clone()?, &mut tmpf)?;
 
     file_r.seek(SeekFrom::Start(0))?;
     let mut parser = PgnParser::new(file_r.try_clone()?);
+    let file_key = file.to_string_lossy();
 
-    parser.offset_by_index(n as usize, &state, &file.to_string_lossy().to_string())?;
+    parser.offset_by_index(n as usize, offsets, file_key.as_ref())?;
 
     tmpf.seek(SeekFrom::Start(parser.position()?))?;
     tmpf.write_all(pgn.as_bytes())?;
@@ -275,5 +303,110 @@ pub async fn write_game(
 
     write_to_end(&mut tmpf, &mut file_w)?;
 
+    offsets.remove(file_key.as_ref());
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const FIRST: &str =
+        "[Event \"First\"]\n[Result \"1-0\"]\n\n1. e4 {Comment} e5 (1... c5) 1-0\n\n";
+    const SECOND: &str = "[Event \"Second\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1\n\n";
+    const THIRD: &str =
+        "[Event \"Third\"]\n[Result \"1/2-1/2\"]\n\n1. c4 {Another comment} e5 1/2-1/2\n\n";
+    const REPLACEMENT: &str =
+        "[Event \"Replacement\"]\n[Result \"*\"]\n\n1. Nf3 d5 (1... Nf6) *\n\n";
+
+    fn pgn_file(contents: &str) -> (TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("games.pgn");
+        fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn replacing_game_preserves_other_games() {
+        let (_dir, path) = pgn_file(&format!("{FIRST}{SECOND}{THIRD}"));
+        let offsets = DashMap::new();
+
+        write_game_file(&path, 1, REPLACEMENT, &offsets).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{FIRST}{REPLACEMENT}{THIRD}")
+        );
+    }
+
+    #[test]
+    fn deleting_game_preserves_other_games() {
+        for (index, expected) in [
+            (0, format!("{SECOND}{THIRD}")),
+            (1, format!("{FIRST}{THIRD}")),
+            (2, format!("{FIRST}{SECOND}")),
+        ] {
+            let (_dir, path) = pgn_file(&format!("{FIRST}{SECOND}{THIRD}"));
+            let offsets = DashMap::new();
+            let key = path.to_string_lossy().into_owned();
+            // both offsets are needed because game 150 requires the second cached entry,
+            // with only one entry, the parser scans the file instead of using the cache
+            offsets.insert(key.clone(), vec![]);
+
+            delete_game_file(&path, index, &offsets).unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+            assert!(!offsets.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn writing_game_creates_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.pgn");
+
+        write_game_file(&path, 0, FIRST, &DashMap::new()).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), FIRST);
+    }
+
+    #[test]
+    fn file_operations_report_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let offsets = DashMap::new();
+
+        assert!(delete_game_file(&dir.path().join("missing.pgn"), 0, &offsets).is_err());
+        assert!(write_game_file(&dir.path().join("missing/new.pgn"), 0, FIRST, &offsets).is_err());
+    }
+
+    #[test]
+    fn editing_game_invalidates_cached_offsets() {
+        let mut games: Vec<String> = (0..205)
+            .map(|i| format!("[Event \"Game {i}\"]\n\n1. e4 e5 1-0\n\n"))
+            .collect();
+        let (_dir, path) = pgn_file(&games.concat());
+
+        let mut parser = PgnParser::new(File::open(&path).unwrap());
+        parser.skip_games(100).unwrap();
+        let at_100 = parser.position().unwrap();
+        parser.skip_games(100).unwrap();
+        let at_200 = parser.position().unwrap();
+
+        let offsets = DashMap::new();
+        let key = path.to_string_lossy().into_owned();
+        offsets.insert(key.clone(), vec![at_100, at_200]);
+
+        // replacing an earlier game shifts the cached positions of later games
+        write_game_file(&path, 1, REPLACEMENT, &offsets).unwrap();
+        assert!(!offsets.contains_key(&key));
+        games[1] = REPLACEMENT.to_string();
+
+        delete_game_file(&path, 150, &offsets).unwrap();
+        games.remove(150);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), games.concat());
+    }
 }
