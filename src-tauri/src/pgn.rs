@@ -352,6 +352,8 @@ mod tests {
             let (_dir, path) = pgn_file(&format!("{FIRST}{SECOND}{THIRD}"));
             let offsets = DashMap::new();
             let key = path.to_string_lossy().into_owned();
+            // both offsets are needed because game 150 requires the second cached entry,
+            // with only one entry, the parser scans the file instead of using the cache
             offsets.insert(key.clone(), vec![]);
 
             delete_game_file(&path, index, &offsets).unwrap();
