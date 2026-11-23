@@ -1,9 +1,9 @@
 import { DragDropContext, Draggable, Droppable } from "@hello-pangea/dnd";
 import { ActionIcon, Box, ScrollArea, Tabs } from "@mantine/core";
-import { useElementSize, useHotkeys, useToggle } from "@mantine/hooks";
+import { useElementSize, useHotkeys } from "@mantine/hooks";
 import { IconPlus } from "@tabler/icons-react";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { type ReactNode, startTransition, useCallback, useEffect } from "react";
+import { type ReactNode, startTransition, useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Mosaic, type MosaicNode } from "react-mosaic-component";
 import { match } from "ts-pattern";
@@ -32,7 +32,7 @@ export default function BoardsPage() {
 
   const [tabs, setTabs] = useAtom(tabsAtom);
   const [activeTab, setActiveTab] = useAtom(activeTabAtom);
-  const [saveModalOpened, toggleSaveModal] = useToggle();
+  const [pendingCloseTab, setPendingCloseTab] = useState<string | null>(null);
 
   useEffect(() => {
     if (tabs.length === 0) {
@@ -49,28 +49,27 @@ export default function BoardsPage() {
       if (value !== null) {
         const closedTab = tabs.find((tab) => tab.value === value);
         const tabState = JSON.parse(sessionStorage.getItem(value) || "{}");
-        if (tabState && isPersistentGameOrigin(closedTab) && tabState.state.dirty && !forced) {
-          toggleSaveModal();
+
+        if (isPersistentGameOrigin(closedTab) && tabState?.state?.dirty && !forced) {
+          setPendingCloseTab(value);
+          setActiveTab(value);
           return;
         }
-        if (value === activeTab) {
-          const index = tabs.findIndex((tab) => tab.value === value);
-          if (tabs.length > 1) {
-            if (index === tabs.length - 1) {
-              startTransition(() => setActiveTab(tabs[index - 1].value));
-            } else {
-              startTransition(() => setActiveTab(tabs[index + 1].value));
-            }
-          } else {
-            startTransition(() => setActiveTab(null));
-          }
-        }
-        startTransition(() => setTabs((prev) => prev.filter((tab) => tab.value !== value)));
+
+        startTransition(() => {
+          setActiveTab((current) => {
+            if (current !== value) return current;
+            const index = tabs.findIndex((tab) => tab.value === value);
+            return tabs[index + 1]?.value ?? tabs[index - 1]?.value ?? null;
+          });
+          setTabs((prev) => prev.filter((tab) => tab.value !== value));
+        });
+
         unwrap(await commands.killEngines(value));
         await commands.abortGame(`${value}-game`);
       }
     },
-    [tabs, activeTab, setTabs, toggleSaveModal, setActiveTab],
+    [tabs, setActiveTab, setTabs],
   );
 
   function selectTab(index: number) {
@@ -146,7 +145,7 @@ export default function BoardsPage() {
     window.addEventListener("keydown", handler, { capture: true });
 
     return () => window.removeEventListener("keydown", handler, { capture: true });
-  }, [closeTab]);
+  }, [closeTab, activeTab]);
 
   const keyMap = useAtomValue(keyMapAtom);
   const showTabBar = useAtomValue(showTabBarAtom);
@@ -260,10 +259,9 @@ export default function BoardsPage() {
         <Tabs.Panel key={tab.value} value={tab.value} h="100%" w="100%" pb="sm" px="xs">
           <TabSwitch
             tab={tab}
-            saveModalOpened={saveModalOpened}
-            toggleSaveModal={toggleSaveModal}
+            pendingCloseTab={pendingCloseTab}
+            cancelClose={() => setPendingCloseTab(null)}
             closeTab={closeTab}
-            activeTab={activeTab}
           />
         </Tabs.Panel>
       ))}
@@ -310,16 +308,14 @@ const compactWindowsStateAtom = atomWithStorage<WindowsState>("compactWindowsSta
 
 function TabSwitch({
   tab,
-  saveModalOpened,
-  toggleSaveModal,
+  pendingCloseTab,
+  cancelClose,
   closeTab,
-  activeTab,
 }: {
   tab: Tab;
-  saveModalOpened: boolean;
-  toggleSaveModal: () => void;
-  closeTab: (value: string | null, forced?: boolean) => void;
-  activeTab: string | null;
+  pendingCloseTab: string | null;
+  cancelClose: () => void;
+  closeTab: (value: string | null, forced?: boolean) => Promise<void>;
 }) {
   const { ref: containerRef, width } = useElementSize();
   const setIsCompactLayout = useSetAtom(isCompactLayoutAtom);
@@ -372,9 +368,10 @@ function TabSwitch({
             />
             <BoardAnalysis />
             <ConfirmChangesModal
-              opened={saveModalOpened}
-              toggle={toggleSaveModal}
-              closeTab={() => closeTab(activeTab, true)}
+              tab={tab}
+              opened={pendingCloseTab === tab.value}
+              onCancel={cancelClose}
+              closeTab={() => closeTab(tab.value, true)}
             />
           </TreeStateProvider>
         ))
