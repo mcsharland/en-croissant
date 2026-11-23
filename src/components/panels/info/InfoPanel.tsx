@@ -216,13 +216,16 @@ function GameSelectorAccordion({
 
   return (
     <>
-      <ConfirmChangesModal
-        opened={confirmChanges}
-        toggle={toggleConfirmChanges}
-        closeTab={() => {
-          void setPage(tempPage, true);
-        }}
-      />
+      {currentTab && (
+        <ConfirmChangesModal
+          opened={confirmChanges}
+          tab={currentTab}
+          onCancel={() => toggleConfirmChanges(false)}
+          closeTab={() => {
+            void setPage(tempPage, true);
+          }}
+        />
+      )}
       <Accordion
         styles={{
           control: {
